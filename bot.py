@@ -1847,14 +1847,10 @@ async def on_startup(app):
         if not success:
             logger.error(f"Startup queued launch fail for {user_id}")
 
-async def main():
-    db = Database(config.DB_FILE)
-    await db.connect()
-    game_mgr = GameManager(db)
-
+def main():
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
-    app.bot_data["db"] = db
-    app.bot_data["game_mgr"] = game_mgr
+    app.bot_data["db"] = None
+    app.bot_data["game_mgr"] = None
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("hub", hub))
@@ -1874,9 +1870,8 @@ async def main():
     app.post_init = on_startup
 
     logger.info("Бот запущен с повышенной надёжностью.")
-    await app.run_polling(close_loop=False)   # <-- вот это изменено
-    await db.close()
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
