@@ -27,6 +27,15 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.error import TelegramError
+from telegram import User as TGUser
+
+# ---------- Утилиты ----------
+def is_owner(user: TGUser) -> bool:
+    if config.OWNER_USER_ID and user.id == config.OWNER_USER_ID:
+        return True
+    if user.username and user.username.lower() == config.OWNER_USERNAME.lower():
+        return True
+    return False
 
 # ---------- Перечисления ----------
 class UserState(StrEnum):
@@ -310,8 +319,8 @@ class Database:
 
     async def has_active_or_pending_invoice(self, user_id: int) -> bool:
         row = await self.fetch_one(
-            "SELECT 1 FROM invoices WHERE user_id = ? AND status IN (?, ?, ?) LIMIT 1",
-            (user_id, InvoiceStatus.PAID, InvoiceStatus.QUEUED, InvoiceStatus.ACTIVE),
+            "SELECT 1 FROM invoices WHERE user_id = ? AND status IN (?, ?, ?, ?) LIMIT 1",
+            (user_id, InvoiceStatus.PAID, InvoiceStatus.QUEUED, InvoiceStatus.ACTIVE, InvoiceStatus.PENDING),
         )
         return row is not None
 
@@ -531,6 +540,30 @@ class Database:
                 await self._conn.execute("ROLLBACK")
                 return False
 
+    async def reject_withdrawal(self, withdraw_id: int) -> Tuple[bool, Optional[Dict]]:
+        async with self._write_lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                w = await self.fetch_one("SELECT * FROM withdrawals WHERE id = ?", (withdraw_id,))
+                if not w or w["status"] != "pending":
+                    await self._conn.execute("ROLLBACK")
+                    return False, None
+
+                # Возвращаем средства
+                await self._conn.execute("UPDATE top SET total = total + ? WHERE user_id = ?",
+                                         (w["amount"], w["user_id"]))
+                await self._conn.execute("UPDATE withdrawals SET status = 'rejected' WHERE id = ?", (withdraw_id,))
+                await self._conn.execute(
+                    "INSERT INTO finance_log (user_id, amount, type, description) VALUES (?, ?, ?, ?)",
+                    (w["user_id"], w["amount"], "withdrawal_rejected", f"Withdrawal #{withdraw_id} rejected")
+                )
+                await self._conn.commit()
+                return True, w
+            except Exception as e:
+                logger.error(f"Reject withdrawal error: {e}")
+                await self._conn.execute("ROLLBACK")
+                return False, None
+
     async def try_mark_charge_processed(self, charge_id: str, user_id: int, amount: int) -> bool:
         """Атомарно пытается вставить charge_id. Возвращает True, если вставка произошла (первый раз)."""
         async with self._write_lock:
@@ -552,7 +585,7 @@ class Database:
             except Exception:
                 await self._conn.execute("ROLLBACK")
                 raise
-            # ---------- Игровой менеджер ----------
+                # ---------- Игровой менеджер ----------
 class GameManager:
     def __init__(self, db: Database):
         self.db = db
@@ -747,47 +780,66 @@ class GameManager:
                           origin_chat_id: int, prepaid: int,
                           invoice_payload: Optional[str]) -> bool:
         """
-        Создаёт игру: сначала отправляет сообщение, потом сохраняет в БД.
-        При ошибке полностью откатывает финансовые операции и уведомляет владельца для возврата charge_id, если нужно.
+        Создаёт игру: сначала пытается отправить сообщение в origin_chat_id,
+        при неудаче – в личку (user_id). Если и это не удалось, откатывает финансы.
         """
         game = self.create_game(user_id, bet, fs, mines, origin_chat_id, prepaid, invoice_payload)
-        # 1. Отправляем сообщение
-        try:
-            markup = self.build_field_markup(game, show_cashout=False)
-            msg = await asyncio.wait_for(
-                self.bot.send_message(
-                    chat_id=origin_chat_id,
-                    text=f"Поле {fs}×{fs} | Доход: 0 ⭐",
-                    reply_markup=markup
-                ),
-                timeout=config.REQUEST_TIMEOUT
-            )
-        except Exception as e:
-            logger.error(f"Failed to send initial game message for {user_id}: {e}")
-            # Откат: возврат prepaid + удаление инвойса (если есть) + уведомление владельца
-            if prepaid > 0:
-                await self.db.update_user_total(user_id, prepaid)
-            if invoice_payload:
-                inv = await self.db.get_invoice(invoice_payload)
-                if inv and inv.get("charge_id"):
-                    success = await self.refund_stars(user_id, inv["charge_id"])
-                    if not success:
-                        await self.notify_owner(
-                            f"⚠️ КРИТИЧЕСКАЯ ОШИБКА: Не удалось отправить сообщение для игры пользователя {user_id}. "
-                            f"Доплата (charge_id={inv['charge_id']}) не возвращена автоматически. "
-                            f"Требуется ручной возврат {inv['bet'] - inv['prepaid']} ⭐."
-                        )
-                await self.db.delete_invoice(invoice_payload)
-            elif prepaid == 0:
-                await self.notify_owner(
-                    f"⚠️ Не удалось запустить игру для {user_id}: ошибка отправки сообщения. prepaid=0, требуется ручной возврат."
+        target_chat = origin_chat_id
+
+        # Пытаемся отправить сообщение в исходный чат, затем в ЛС
+        for attempt, chat_id in enumerate([origin_chat_id, user_id]):
+            try:
+                markup = self.build_field_markup(game, show_cashout=False)
+                msg = await asyncio.wait_for(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Поле {fs}×{fs} | Доход: 0 ⭐",
+                        reply_markup=markup
+                    ),
+                    timeout=config.REQUEST_TIMEOUT
                 )
-            return False
+                target_chat = chat_id
+                break
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"Не удалось отправить игру в чат {chat_id}, пробуем ЛС: {e}")
+                else:
+                    logger.error(f"Не удалось отправить игру ни в группу, ни в ЛС для {user_id}: {e}")
+                    # Полный откат
+                    if prepaid > 0:
+                        await self.db.update_user_total(user_id, prepaid)
+                    if invoice_payload:
+                        inv = await self.db.get_invoice(invoice_payload)
+                        if inv and inv.get("charge_id"):
+                            success_refund = await self.refund_stars(user_id, inv["charge_id"])
+                            if not success_refund:
+                                await self.notify_owner(
+                                    f"⚠️ КРИТИЧЕСКАЯ ОШИБКА: Не удалось отправить игру {user_id}. "
+                                    f"charge_id={inv['charge_id']} не возвращён автоматически. "
+                                    f"Требуется ручной возврат {inv['bet'] - inv['prepaid']} ⭐."
+                                )
+                        await self.db.delete_invoice(invoice_payload)
+                    elif prepaid == 0:
+                        await self.notify_owner(
+                            f"⚠️ Не удалось запустить игру для {user_id}: ошибка отправки. prepaid=0, ручной возврат."
+                        )
+                    return False
 
         game["message_id"] = msg.message_id
-        game["chat_id"] = origin_chat_id
+        game["chat_id"] = target_chat
+        game["origin_chat_id"] = target_chat   # обновляем реальный чат
 
-        # 2. Атомарно сохраняем игру в БД
+        # Если игра переехала в ЛС – уведомим пользователя
+        if target_chat != origin_chat_id:
+            try:
+                await self.bot.send_message(
+                    target_chat,
+                    "⚠️ Игра перенесена в этот чат, так как исходный чат недоступен."
+                )
+            except Exception:
+                pass
+
+        # Сохраняем игру в БД атомарно
         try:
             async with self.db._write_lock:
                 await self.db._conn.execute("BEGIN IMMEDIATE")
@@ -798,7 +850,7 @@ class GameManager:
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (user_id, bet, prepaid, mines, fs,
                          json.dumps(game["board"]), json.dumps(game["opened"]),
-                         0, 1, msg.message_id, origin_chat_id, origin_chat_id, invoice_payload, game["created"]),
+                         0, 1, msg.message_id, target_chat, target_chat, invoice_payload, game["created"]),
                     )
                     if invoice_payload:
                         await self.db._conn.execute(
@@ -813,20 +865,20 @@ class GameManager:
             logger.error(f"DB error while launching game for {user_id}: {e}")
             # Удаляем отправленное сообщение
             try:
-                await self.bot.delete_message(origin_chat_id, msg.message_id)
+                await self.bot.delete_message(target_chat, msg.message_id)
             except Exception:
                 pass
-            # Откат: возврат prepaid + удаление инвойса + уведомление владельца
+            # Откат финансов
             if prepaid > 0:
                 await self.db.update_user_total(user_id, prepaid)
             if invoice_payload:
                 inv = await self.db.get_invoice(invoice_payload)
                 if inv and inv.get("charge_id"):
-                    success = await self.refund_stars(user_id, inv["charge_id"])
-                    if not success:
+                    success_refund = await self.refund_stars(user_id, inv["charge_id"])
+                    if not success_refund:
                         await self.notify_owner(
-                            f"⚠️ КРИТИЧЕСКАЯ ОШИБКА: Ошибка БД при запуске игры для {user_id}. "
-                            f"charge_id={inv['charge_id']} не возвращён автоматически. "
+                            f"⚠️ Ошибка БД при запуске игры для {user_id}. "
+                            f"charge_id={inv['charge_id']} не возвращён. "
                             f"Требуется ручной возврат {inv['bet'] - inv['prepaid']} ⭐."
                         )
                 await self.db.delete_invoice(invoice_payload)
@@ -1011,8 +1063,7 @@ async def _launch_queued_if_any(game_mgr: GameManager, db: Database, user_id: in
                                                     "Предоплаченная часть возвращена на баланс.")
         except Exception:
             pass
-
-# ---------- Обработчики команд ----------
+            # ---------- Обработчики команд ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используй /hub, чтобы войти в игровое лобби.")
 
@@ -1275,10 +1326,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if data == "withdraw":
-            await query.answer()
             total = await db.get_user_total(user_id)
             if total <= 0:
                 await query.answer("Нет доступных для вывода звёзд.", show_alert=True)
+                # Дополнительно отправляем сообщение, так как alert может не показаться
+                try:
+                    await context.bot.send_message(chat_id=user_id, text="У вас 0 звёзд, вывод невозможен.")
+                except Exception:
+                    pass
                 return
             if await db.has_pending_withdrawal(user_id):
                 await query.answer("У вас уже есть заявка на вывод. Дождитесь подтверждения.", show_alert=True)
@@ -1311,7 +1366,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_name = f"@{user.username}" if user.username else user.full_name
             owner_text = f"📤 {user_name} оформил вывод на {amount} звезд"
             owner_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Подтвердить", callback_data=f"confirm_withdraw_{withdraw_id}")]
+                [InlineKeyboardButton("Подтвердить", callback_data=f"confirm_withdraw_{withdraw_id}"),
+                 InlineKeyboardButton("Отклонить", callback_data=f"reject_withdraw_{withdraw_id}")]
             ])
             await game_mgr.notify_owner(owner_text, reply_markup=owner_kb)
             await query.answer("Заявка на вывод создана и отправлена на подтверждение.", show_alert=True)
@@ -1321,12 +1377,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("confirm_withdraw_"):
             # Проверка владельца по ID или username
-            is_owner = False
-            if config.OWNER_USER_ID and query.from_user.id == config.OWNER_USER_ID:
-                is_owner = True
-            elif query.from_user.username and query.from_user.username.lower() == config.OWNER_USERNAME.lower():
-                is_owner = True
-            if not is_owner:
+            if not is_owner(query.from_user):
                 await query.answer("Только владелец может подтверждать вывод.", show_alert=True)
                 return
             try:
@@ -1351,6 +1402,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await query.answer("Ошибка подтверждения (возможно, недостаточно средств).", show_alert=True)
+            return
+
+        if data.startswith("reject_withdraw_"):
+            if not is_owner(query.from_user):
+                await query.answer("Только владелец может отклонять вывод.", show_alert=True)
+                return
+            try:
+                w_id = int(data.split("_")[2])
+            except (IndexError, ValueError):
+                await query.answer("Неверный идентификатор заявки")
+                return
+            success, w = await db.reject_withdrawal(w_id)
+            if success and w:
+                try:
+                    await game_mgr.bot.send_message(
+                        chat_id=w["user_id"],
+                        text=f"❌ Ваша заявка на вывод {w['amount']} ⭐ отклонена. Звёзды возвращены на баланс."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user {w['user_id']} about withdrawal rejection: {e}")
+                await query.edit_message_text(
+                    text=f"❌ Заявка на вывод {w['amount']} ⭐ для {w['user_id']} отклонена. Звёзды возвращены.",
+                    reply_markup=None
+                )
+                await query.answer("Заявка отклонена.")
+            else:
+                await query.answer("Ошибка при отклонении заявки (возможно, уже обработана).", show_alert=True)
             return
 
         if data.startswith("field_"):
@@ -1470,10 +1548,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if remaining == 0:
                         success = await game_mgr.launch_game(user_id, bet, fs, mines, origin_chat_id, prepaid, None)
                         if not success:
-                            # Откат при ошибке запуска игры
-                            await db.update_user_total(user_id, prepaid)
-                            await db._log_finance(user_id, prepaid, "prepay_refund", "Refund after failed game launch")
-                            await query.answer("Ошибка запуска игры, ставка возвращена.", show_alert=True)
+                            # launch_game уже сделал возврат prepaid при ошибке
+                            await query.answer("Ошибка запуска игры, средства уже возвращены.", show_alert=True)
                         else:
                             await query.answer("Игра началась за счёт вашего баланса!", show_alert=True)
                         return
@@ -1725,9 +1801,13 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         origin = inv.get("origin_chat_id") or user_id
         prepaid = inv["prepaid"]
 
-        if game_mgr.user_state.get(user_id) in (UserState.AWAITING_BET, UserState.AWAITING_FIELD, UserState.CHOOSING_MINES, UserState.READY) or \
-           (user_id in game_mgr.games and game_mgr.games[user_id].get("active")):
+        # Если пользователь в промежуточном состоянии или уже в игре, инвойс уходит в очередь
+        if (game_mgr.user_state.get(user_id) in (UserState.AWAITING_BET, UserState.AWAITING_FIELD, UserState.CHOOSING_MINES, UserState.READY)
+                or (user_id in game_mgr.games and game_mgr.games[user_id].get("active"))):
             await db.set_invoice_status(payload, InvoiceStatus.QUEUED)
+            # Принудительно сбрасываем состояние, чтобы не заблокировать очередь
+            game_mgr.user_state.pop(user_id, None)
+            game_mgr.user_temp_data.pop(user_id, None)
             await update.message.reply_text("Платёж получен, игра начнётся после завершения текущих действий.")
             return
 
@@ -1741,12 +1821,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------- Promo handlers ----------
 async def setpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    is_owner = False
-    if config.OWNER_USER_ID and user.id == config.OWNER_USER_ID:
-        is_owner = True
-    elif user.username and user.username.lower() == config.OWNER_USERNAME.lower():
-        is_owner = True
-    if not is_owner:
+    if not is_owner(user):
         await update.message.reply_text("Только владелец бота может создавать промокоды.")
         return
     args = context.args
@@ -1811,6 +1886,11 @@ async def cache_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(app):
     db = app.bot_data["db"]
     game_mgr = app.bot_data["game_mgr"]
+
+    # ----- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ -----
+    game_mgr.set_bot(app.bot)                 # даём менеджеру доступ к боту
+    await game_mgr._resolve_owner_chat_id()   # определяем чат владельца
+
     # Восстановление активных игр после перезапуска
     active_games = await db.load_active_games()
     for g in active_games:
@@ -1834,9 +1914,6 @@ async def on_startup(app):
         if not success:
             logger.error(f"Startup queued launch fail for {user_id}")
 
-    # Разрешаем владельца (опционально, ошибка не фатальная)
-    await game_mgr._resolve_owner_chat_id()
-
 
 def main():
     db = Database(config.DB_FILE)
@@ -1844,7 +1921,7 @@ def main():
     asyncio.get_event_loop().run_until_complete(db.connect())
 
     game_mgr = GameManager(db)
-    game_mgr.set_bot(None)  # бот будет присвоен позже в on_startup
+    # game_mgr.set_bot(None) – больше не нужно, присвоим в on_startup
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
     app.bot_data["db"] = db
