@@ -1878,9 +1878,11 @@ async def main():
     await db.close()
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(main())
-    finally:
-        loop.close()
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(main())
+    else:
+        # Railway уже запустил свой event loop — добавляем задачу
+        loop.create_task(main())
+        loop.run_forever()
