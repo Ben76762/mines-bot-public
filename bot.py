@@ -1809,22 +1809,9 @@ async def cache_cleanup_job(context: ContextTypes.DEFAULT_TYPE):
     await game_mgr.cleanup_unused_locks()
 
 async def on_startup(app):
-    db: Database = app.bot_data["db"]
-    game_mgr: GameManager = app.bot_data["game_mgr"]
-    game_mgr.set_bot(app.bot)
-    await game_mgr._resolve_owner_chat_id()
-
-    # Безопасное преобразование статусов ACTIVE->QUEUED только для орфанов
-    active_invoices = await db.get_invoices_by_status(InvoiceStatus.ACTIVE)
-    for inv in active_invoices:
-        game_exists = await db.fetch_one(
-            "SELECT 1 FROM active_games WHERE invoice_payload = ? AND active = 1",
-            (inv["payload"],)
-        )
-        if not game_exists:
-            await db.set_invoice_status(inv["payload"], InvoiceStatus.QUEUED)
-            logger.info(f"Orphan active invoice {inv['payload']} moved to queued on startup.")
-
+    db = app.bot_data["db"]
+    game_mgr = app.bot_data["game_mgr"]
+    # Восстановление активных игр после перезапуска
     active_games = await db.load_active_games()
     for g in active_games:
         game_mgr.games[g["user_id"]] = g
@@ -1847,10 +1834,14 @@ async def on_startup(app):
         if not success:
             logger.error(f"Startup queued launch fail for {user_id}")
 
+
 def main():
+    db = Database(config.DB_FILE)
+    game_mgr = GameManager(db)
+
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
-    app.bot_data["db"] = None
-    app.bot_data["game_mgr"] = None
+    app.bot_data["db"] = db
+    app.bot_data["game_mgr"] = game_mgr
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("hub", hub))
@@ -1869,8 +1860,14 @@ def main():
 
     app.post_init = on_startup
 
+    # Даём game_mgr экземпляр бота после создания приложения
+    game_mgr.set_bot(app.bot)
+    # Узнаём ID владельца
+    asyncio.get_event_loop().run_until_complete(game_mgr._resolve_owner_chat_id())
+
     logger.info("Бот запущен с повышенной надёжностью.")
     app.run_polling(close_loop=False)
+    db.close()
 
 
 if __name__ == "__main__":
