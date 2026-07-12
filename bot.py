@@ -1834,10 +1834,17 @@ async def on_startup(app):
         if not success:
             logger.error(f"Startup queued launch fail for {user_id}")
 
+    # Разрешаем владельца (опционально, ошибка не фатальная)
+    await game_mgr._resolve_owner_chat_id()
+
 
 def main():
     db = Database(config.DB_FILE)
+    # Синхронно подключаем базу перед созданием приложения
+    asyncio.get_event_loop().run_until_complete(db.connect())
+
     game_mgr = GameManager(db)
+    game_mgr.set_bot(None)  # бот будет присвоен позже в on_startup
 
     app = ApplicationBuilder().token(config.BOT_TOKEN).build()
     app.bot_data["db"] = db
@@ -1860,14 +1867,11 @@ def main():
 
     app.post_init = on_startup
 
-    # Даём game_mgr экземпляр бота после создания приложения
-    game_mgr.set_bot(app.bot)
-    # Узнаём ID владельца
-    asyncio.get_event_loop().run_until_complete(game_mgr._resolve_owner_chat_id())
-
     logger.info("Бот запущен с повышенной надёжностью.")
     app.run_polling(close_loop=False)
-    db.close()
+
+    # Закрываем базу после остановки бота
+    asyncio.get_event_loop().run_until_complete(db.close())
 
 
 if __name__ == "__main__":
