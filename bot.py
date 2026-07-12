@@ -1874,15 +1874,9 @@ async def main():
     app.post_init = on_startup
 
     logger.info("Бот запущен с повышенной надёжностью.")
-    await app.run_polling()
+    await app.run_polling(close_loop=False)   # <-- вот это изменено
     await db.close()
 
+
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(main())
-    else:
-        # Railway уже запустил свой event loop — добавляем задачу
-        loop.create_task(main())
-        loop.run_forever()
+    asyncio.run(main())
